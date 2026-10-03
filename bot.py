@@ -90,12 +90,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /start"""
     welcome_message = (
         "👋 Привет! Я бот для конвертации вопросов.\n\n"
-        "📄 Отправь мне документ .docx с вопросами в формате:\n"
+        "📄 Отправь мне:\n"
+        "• Документ .docx с вопросами\n"
+        "• Или текст напрямую в сообщении\n\n"
+        "📝 Формат входных данных:\n"
         "<question>Вопрос?\n"
         "<variant>Вариант 1\n"
         "<variant>Вариант 2\n"
         "<variant>Вариант 3\n\n"
-        "📥 Я конвертирую его в .txt файл с форматом:\n"
+        "📥 Я конвертирую в формат:\n"
         "?Вопрос?\n"
         "+Вариант 1 (правильный)\n"
         "-Вариант 2\n"
@@ -172,22 +175,40 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка текстовых сообщений (для тестирования)"""
+    """Обработка текстовых сообщений"""
     user_text = update.message.text
 
     try:
+        # Конвертируем формат
         converted = convert_quiz_format(user_text)
 
-        if converted:
+        if not converted:
+            await update.message.reply_text(
+                "❌ Не удалось распознать формат.\n"
+                "Убедись, что используешь правильный формат:\n\n"
+                "<question>Текст вопроса\n"
+                "<variant>Вариант 1\n"
+                "<variant>Вариант 2"
+            )
+            return
+
+        # Если результат большой (больше 1000 символов), отправляем файлом
+        if len(converted) > 1000:
+            output_file = BytesIO(converted.encode('utf-8'))
+            output_file.name = 'converted_questions.txt'
+
+            await update.message.reply_document(
+                document=output_file,
+                filename='converted_questions.txt',
+                caption=f"✅ Конвертировано успешно!\n📊 Найдено вопросов: {converted.count('?')}"
+            )
+        else:
+            # Если результат короткий, отправляем текстом
             await update.message.reply_text(
                 f"✅ Результат конвертации:\n\n{converted}",
                 parse_mode=None
             )
-        else:
-            await update.message.reply_text(
-                "❌ Не удалось распознать формат.\n"
-                "Или отправь .docx файл для полной обработки."
-            )
+
     except Exception as e:
         await update.message.reply_text(
             f"❌ Ошибка: {str(e)}"
