@@ -2,7 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 Telegram бот для конвертации вопросов из формата документа в формат приложения Ассистент
-Принимает: .docx файл
+Принимает: .docx файл или текст
+Спрашивает пользователя, какой вариант правильный для каждого вопроса
 Возвращает: .txt файл с конвертированными вопросами
 """
 
@@ -10,30 +11,39 @@ import re
 import os
 from io import BytesIO
 from docx import Document
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+    ContextTypes,
+    ConversationHandler
+)
 
-# Вставь сюда токен от BotFather
-TELEGRAM_TOKEN = "8911964732:AAHlFZ2Ads45apMnIyrSdS1pMhZK7OHI4eA"
+# Токен бота берётся из переменной окружения для безопасности
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8911964732:AAHlFZ2Ads45apMnIyrSdS1pMhZK7OHI4eA")
+
+# Состояния для ConversationHandler
+SELECTING_ANSWERS = 1
 
 
-def convert_quiz_format(text: str) -> str:
+def parse_questions(text: str) -> list:
     """
-    Конвертирует формат вопросов из <question>/<variant> в ?/+/- формат
+    Парсит текст и извлекает вопросы и варианты ответов
 
-    Входной формат:
-    <question>Вопрос текст
-    <variant>Вариант 1
-    <variant>Вариант 2
-    <variant>Вариант 3
-
-    Выходной формат:
-    ?Вопрос текст
-    +Вариант 1 (первый - всегда правильный)
-    -Вариант 2
-    -Вариант 3
+    Возвращает список словарей:
+    [
+        {
+            'question': 'Текст вопроса',
+            'variants': ['Вариант 1', 'Вариант 2', 'Вариант 3'],
+            'correct_index': None  # заполнится позже
+        },
+        ...
+    ]
     """
-    result = []
+    questions = []
     lines = text.strip().split('\n')
 
     current_question = None
@@ -43,45 +53,59 @@ def convert_quiz_format(text: str) -> str:
         line = line.strip()
 
         if not line:
-            # Если пустая строка и есть накопленный вопрос, сохраняем его
             if current_question and variants:
-                result.append(f"?{current_question}")
-                result.append(f"+{variants[0]}")  # Первый вариант - правильный
-                for variant in variants[1:]:
-                    result.append(f"-{variant}")
-                result.append("")  # Пустая строка между вопросами
-
+                questions.append({
+                    'question': current_question,
+                    'variants': variants,
+                    'correct_index': None
+                })
                 current_question = None
                 variants = []
             continue
 
-        # Проверяем, есть ли теги
         if '<question>' in line:
-            # Сохраняем предыдущий вопрос, если был
             if current_question and variants:
-                result.append(f"?{current_question}")
-                result.append(f"+{variants[0]}")
-                for variant in variants[1:]:
-                    result.append(f"-{variant}")
-                result.append("")
+                questions.append({
+                    'question': current_question,
+                    'variants': variants,
+                    'correct_index': None
+                })
                 variants = []
 
-            # Извлекаем текст вопроса
             question_text = re.sub(r'</?question>', '', line).strip()
             current_question = question_text
 
         elif '<variant>' in line:
-            # Извлекаем текст варианта
             variant_text = re.sub(r'</?variant>', '', line).strip()
             if variant_text:
                 variants.append(variant_text)
 
-    # Добавляем последний вопрос, если он есть
     if current_question and variants:
-        result.append(f"?{current_question}")
-        result.append(f"+{variants[0]}")
-        for variant in variants[1:]:
-            result.append(f"-{variant}")
+        questions.append({
+            'question': current_question,
+            'variants': variants,
+            'correct_index': None
+        })
+
+    return questions
+
+
+def generate_output(questions: list) -> str:
+    """
+    Генерирует финальный текст в формате ?/+/-
+    """
+    result = []
+
+    for q in questions:
+        result.append(f"?{q['question']}")
+
+        for i, variant in enumerate(q['variants']):
+            if i == q['correct_index']:
+                result.append(f"+{variant}")
+            else:
+                result.append(f"-{variant}")
+
+        result.append("")  # Пустая строка между вопросами
 
     return '\n'.join(result)
 
@@ -98,80 +122,65 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<variant>Вариант 1\n"
         "<variant>Вариант 2\n"
         "<variant>Вариант 3\n\n"
-        "📥 Я конвертирую в формат:\n"
+        "Я спрошу для каждого вопроса, какой вариант правильный!\n\n"
+        "📥 Результат будет в формате:\n"
         "?Вопрос?\n"
-        "+Вариант 1 (правильный)\n"
-        "-Вариант 2\n"
-        "-Вариант 3\n\n"
-        "⚠️ Первый вариант автоматически помечается как правильный!"
+        "+Правильный вариант\n"
+        "-Неправильный вариант\n"
+        "-Неправильный вариант"
     )
     await update.message.reply_text(welcome_message)
+    return ConversationHandler.END
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка документов"""
+    """Обработка .docx документов"""
     document = update.message.document
 
-    # Проверяем, что это .docx файл
     if not document.file_name.endswith('.docx'):
         await update.message.reply_text(
             "❌ Пожалуйста, отправь файл в формате .docx"
         )
-        return
+        return ConversationHandler.END
 
     try:
-        # Отправляем уведомление о начале обработки
         processing_msg = await update.message.reply_text("⏳ Обрабатываю документ...")
 
-        # Скачиваем файл
         file = await document.get_file()
         file_bytes = await file.download_as_bytearray()
 
-        # Читаем .docx документ
         doc = Document(BytesIO(file_bytes))
-
-        # Извлекаем весь текст из документа
         full_text = []
         for paragraph in doc.paragraphs:
             if paragraph.text.strip():
                 full_text.append(paragraph.text.strip())
 
         original_text = '\n'.join(full_text)
+        questions = parse_questions(original_text)
 
-        # Конвертируем формат
-        converted_text = convert_quiz_format(original_text)
+        await processing_msg.delete()
 
-        if not converted_text:
-            await processing_msg.edit_text(
+        if not questions:
+            await update.message.reply_text(
                 "❌ Не удалось найти вопросы в документе.\n"
                 "Убедись, что формат правильный:\n"
                 "<question>Текст вопроса\n"
                 "<variant>Вариант 1\n"
                 "<variant>Вариант 2"
             )
-            return
+            return ConversationHandler.END
 
-        # Создаём имя выходного файла
-        output_filename = document.file_name.replace('.docx', '_converted.txt')
+        context.user_data['questions'] = questions
+        context.user_data['current_question'] = 0
+        context.user_data['original_filename'] = document.file_name
 
-        # Отправляем результат как файл
-        output_file = BytesIO(converted_text.encode('utf-8'))
-        output_file.name = output_filename
-
-        await update.message.reply_document(
-            document=output_file,
-            filename=output_filename,
-            caption=f"✅ Конвертировано успешно!\n📊 Найдено вопросов: {converted_text.count('?')}"
-        )
-
-        # Удаляем сообщение о процессе
-        await processing_msg.delete()
+        return await ask_next_question(update, context)
 
     except Exception as e:
         await update.message.reply_text(
-            f"❌ Ошибка при обработке документа:\n{str(e)}\n\n"
-            "Проверь формат документа и попробуй снова."
+            f"❌ Ошибка при обработке документа:\n{str(e)}"
         )
+        return ConversationHandler.END
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -179,10 +188,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
 
     try:
-        # Конвертируем формат
-        converted = convert_quiz_format(user_text)
+        questions = parse_questions(user_text)
 
-        if not converted:
+        if not questions:
             await update.message.reply_text(
                 "❌ Не удалось распознать формат.\n"
                 "Убедись, что используешь правильный формат:\n\n"
@@ -190,80 +198,183 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "<variant>Вариант 1\n"
                 "<variant>Вариант 2"
             )
-            return
+            return ConversationHandler.END
 
-        # Если результат большой (больше 1000 символов), отправляем файлом
-        if len(converted) > 1000:
-            output_file = BytesIO(converted.encode('utf-8'))
-            output_file.name = 'converted_questions.txt'
+        context.user_data['questions'] = questions
+        context.user_data['current_question'] = 0
+        context.user_data['original_filename'] = None
 
-            await update.message.reply_document(
-                document=output_file,
-                filename='converted_questions.txt',
-                caption=f"✅ Конвертировано успешно!\n📊 Найдено вопросов: {converted.count('?')}"
-            )
-        else:
-            # Если результат короткий, отправляем текстом
-            await update.message.reply_text(
-                f"✅ Результат конвертации:\n\n{converted}",
-                parse_mode=None
-            )
+        return await ask_next_question(update, context)
 
     except Exception as e:
         await update.message.reply_text(
             f"❌ Ошибка: {str(e)}"
         )
+        return ConversationHandler.END
+
+
+async def ask_next_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Спрашивает пользователя о правильном ответе для текущего вопроса"""
+    questions = context.user_data['questions']
+    current_idx = context.user_data['current_question']
+
+    if current_idx >= len(questions):
+        return await finish_conversion(update, context)
+
+    q = questions[current_idx]
+
+    message_text = (
+        f"📝 Вопрос {current_idx + 1} из {len(questions)}:\n\n"
+        f"❓ {q['question']}\n\n"
+        "Какой вариант правильный?"
+    )
+
+    keyboard = []
+    for i, variant in enumerate(q['variants']):
+        keyboard.append([
+            InlineKeyboardButton(
+                f"{i + 1}. {variant[:50]}{'...' if len(variant) > 50 else ''}",
+                callback_data=f"answer_{i}"
+            )
+        ])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            text=message_text,
+            reply_markup=reply_markup
+        )
+    else:
+        await update.message.reply_text(
+            text=message_text,
+            reply_markup=reply_markup
+        )
+
+    return SELECTING_ANSWERS
+
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка нажатий на кнопки с вариантами ответов"""
+    query = update.callback_query
+    await query.answer()
+
+    answer_idx = int(query.data.split('_')[1])
+
+    questions = context.user_data['questions']
+    current_idx = context.user_data['current_question']
+
+    questions[current_idx]['correct_index'] = answer_idx
+    context.user_data['current_question'] += 1
+
+    return await ask_next_question(update, context)
+
+
+async def finish_conversion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Завершает конвертацию и отправляет результат"""
+    questions = context.user_data['questions']
+    output_text = generate_output(questions)
+
+    filename = context.user_data.get('original_filename')
+    if filename:
+        output_filename = filename.replace('.docx', '_converted.txt')
+    else:
+        output_filename = 'converted_questions.txt'
+
+    output_file = BytesIO(output_text.encode('utf-8'))
+    output_file.name = output_filename
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            "✅ Отлично! Все ответы собраны. Отправляю результат..."
+        )
+        await update.callback_query.message.reply_document(
+            document=output_file,
+            filename=output_filename,
+            caption=f"✅ Конвертация завершена!\n📊 Вопросов: {len(questions)}"
+        )
+    else:
+        await update.message.reply_document(
+            document=output_file,
+            filename=output_filename,
+            caption=f"✅ Конвертация завершена!\n📊 Вопросов: {len(questions)}"
+        )
+
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена процесса конвертации"""
+    await update.message.reply_text(
+        "❌ Конвертация отменена.\n"
+        "Отправь новый документ или текст, чтобы начать заново."
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /help"""
     help_text = (
         "📖 Инструкция:\n\n"
-        "1️⃣ Подготовь .docx документ с вопросами\n"
-        "2️⃣ Отправь документ в этот чат\n"
-        "3️⃣ Получи .txt файл с конвертированными вопросами\n\n"
-        "📝 Формат входного документа:\n"
+        "1️⃣ Подготовь .docx документ или текст с вопросами\n"
+        "2️⃣ Отправь его мне в чат\n"
+        "3️⃣ Для каждого вопроса выбери правильный вариант\n"
+        "4️⃣ Получи .txt файл с конвертированными вопросами\n\n"
+        "📝 Формат входных данных:\n"
         "<question>Столица России?\n"
         "<variant>Москва\n"
         "<variant>Санкт-Петербург\n"
         "<variant>Казань\n\n"
-        "<question>Следующий вопрос?\n"
-        "<variant>Ответ 1\n"
-        "<variant>Ответ 2\n\n"
         "📤 Формат выходного файла:\n"
         "?Столица России?\n"
         "+Москва\n"
         "-Санкт-Петербург\n"
         "-Казань\n\n"
-        "?Следующий вопрос?\n"
-        "+Ответ 1\n"
-        "-Ответ 2\n\n"
-        "⚠️ Первый вариант всегда правильный (+)"
+        "Команды:\n"
+        "/start - Начать работу\n"
+        "/help - Эта справка\n"
+        "/cancel - Отменить текущую конвертацию"
     )
     await update.message.reply_text(help_text)
 
 
 def main():
     """Запуск бота"""
-    # Проверка токена
-    if TELEGRAM_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        print("❌ ОШИБКА: Установи токен бота в переменной TELEGRAM_TOKEN")
-        print("📝 Получить токен можно у @BotFather в Telegram")
+    if not TELEGRAM_TOKEN:
+        print("❌ ОШИБКА: Установи переменную окружения TELEGRAM_TOKEN")
         return
 
-    # Создаем приложение
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Регистрируем обработчики
+    # ConversationHandler для управления процессом выбора ответов
+    conv_handler = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.Document.FileExtension("docx"), handle_document),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
+        ],
+        states={
+            SELECTING_ANSWERS: [
+                CallbackQueryHandler(button_callback, pattern="^answer_")
+            ]
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel)
+        ],
+        per_user=True,
+        per_chat=True
+    )
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(MessageHandler(filters.Document.FileExtension("docx"), handle_document))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    application.add_handler(conv_handler)
 
-    # Запускаем бота
     print("🤖 Бот запущен и готов к работе!")
-    print("📄 Принимает: .docx файлы")
+    print("📄 Принимает: .docx файлы и текст")
+    print("❓ Спрашивает правильные ответы для каждого вопроса")
     print("📤 Возвращает: .txt файлы")
+
     application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
